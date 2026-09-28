@@ -129,50 +129,87 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		return false;
 	}
 
-	const auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
-	if (mapped == nullptr) {
-		EXIT("BufferCache: download exceeds 64 MiB staging buffer capacity\n");
-	}
-	m_download_buffer.Commit();
-	for (auto& copy: copies) {
-		copy.dstOffset += offset;
-	}
-
-	auto& command = m_scheduler.Current();
-	command.EndRendering();
-	const auto              native = command.Handle();
-	vk::BufferMemoryBarrier before {};
-	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
-	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	before.buffer              = buffer.Handle();
-	before.offset              = 0;
-	before.size                = buffer.Size();
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
-	                       nullptr);
-	native.copyBuffer(buffer.Handle(), m_download_buffer.Handle(),
-	                  static_cast<uint32_t>(copies.size()), copies.data());
-
-	auto after          = before;
-	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
-	after.buffer        = m_download_buffer.Handle();
-	after.offset        = offset;
-	after.size          = total_size;
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                       vk::PipelineStageFlagBits::eAllCommands |
-	                           vk::PipelineStageFlagBits::eHost,
-	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([this, mapped, offset, total_size, buffer_address,
-	                                    copies = std::move(copies)] {
-		m_download_buffer.Invalidate(offset, total_size);
-		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
+	const auto flush_batch = [&](std::vector<vk::BufferCopy> batch, uint64_t batch_size) {
+		const auto [mapped, offset] = m_download_buffer.Map(batch_size, 64);
+		if (mapped == nullptr) {
+			EXIT("BufferCache: download exceeds staging buffer capacity\n");
 		}
-	});
+		m_download_buffer.Commit();
+		for (auto& copy: batch) {
+			copy.dstOffset += offset;
+		}
+
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		const auto              native = command.Handle();
+		vk::BufferMemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.buffer              = buffer.Handle();
+		before.offset              = 0;
+		before.size                = buffer.Size();
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+		                       nullptr);
+		native.copyBuffer(buffer.Handle(), m_download_buffer.Handle(),
+		                  static_cast<uint32_t>(batch.size()), batch.data());
+
+		auto after          = before;
+		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		after.buffer        = m_download_buffer.Handle();
+		after.offset        = offset;
+		after.size          = batch_size;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                       vk::PipelineStageFlagBits::eAllCommands |
+		                           vk::PipelineStageFlagBits::eHost,
+		                       {}, 0, nullptr, 1, &after, 0, nullptr);
+		m_scheduler.DeferPriorityOperation([this, mapped, offset, batch_size, buffer_address,
+		                                    batch = std::move(batch)] {
+			m_download_buffer.Invalidate(offset, batch_size);
+			for (const auto& copy: batch) {
+				Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
+				                                      mapped + (copy.dstOffset - offset), copy.size);
+			}
+		});
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
+	};
+
+	const uint64_t cap = m_download_buffer.Size();
+	size_t         i   = 0;
+	while (i < copies.size()) {
+		std::vector<vk::BufferCopy> batch;
+		uint64_t                    batch_size = 0;
+		while (i < copies.size()) {
+			vk::BufferCopy piece = copies[i];
+			uint64_t       need  = Common::AlignUp(piece.size, 64);
+			if (need > cap) {
+				if (!batch.empty()) {
+					break;
+				}
+				piece.size = cap;
+				need       = cap;
+				copies[i].srcOffset += cap;
+				copies[i].size -= cap;
+				if (copies[i].size == 0) {
+					++i;
+				}
+			} else if (batch_size + need > cap && !batch.empty()) {
+				break;
+			} else {
+				++i;
+			}
+			piece.dstOffset = batch_size;
+			batch.push_back(piece);
+			batch_size += need;
+		}
+		flush_batch(std::move(batch), batch_size);
+	}
+	(void)total_size;
 	return true;
 }
 
@@ -185,7 +222,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
-      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
+      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 256 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
