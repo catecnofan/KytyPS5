@@ -129,87 +129,55 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		return false;
 	}
 
-	const auto flush_batch = [&](std::vector<vk::BufferCopy> batch, uint64_t batch_size) {
-		const auto [mapped, offset] = m_download_buffer.Map(batch_size, 64);
-		if (mapped == nullptr) {
-			EXIT("BufferCache: download exceeds staging buffer capacity\n");
-		}
+	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
+	std::unique_ptr<Buffer> temporary;
+	if (mapped == nullptr) {
+		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                     vk::BufferUsageFlagBits::eTransferDst, total_size);
+		mapped = temporary->Mapped().data();
+	} else {
 		m_download_buffer.Commit();
-		for (auto& copy: batch) {
-			copy.dstOffset += offset;
-		}
-
-		auto& command = m_scheduler.Current();
-		command.EndRendering();
-		const auto              native = command.Handle();
-		vk::BufferMemoryBarrier before {};
-		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-		before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
-		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.buffer              = buffer.Handle();
-		before.offset              = 0;
-		before.size                = buffer.Size();
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
-		                       nullptr);
-		native.copyBuffer(buffer.Handle(), m_download_buffer.Handle(),
-		                  static_cast<uint32_t>(batch.size()), batch.data());
-
-		auto after          = before;
-		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-		after.dstAccessMask = vk::AccessFlagBits::eHostRead;
-		after.buffer        = m_download_buffer.Handle();
-		after.offset        = offset;
-		after.size          = batch_size;
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-		                       vk::PipelineStageFlagBits::eAllCommands |
-		                           vk::PipelineStageFlagBits::eHost,
-		                       {}, 0, nullptr, 1, &after, 0, nullptr);
-		m_scheduler.DeferPriorityOperation([this, mapped, offset, batch_size, buffer_address,
-		                                    batch = std::move(batch)] {
-			m_download_buffer.Invalidate(offset, batch_size);
-			for (const auto& copy: batch) {
-				Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-				                                      mapped + (copy.dstOffset - offset), copy.size);
-			}
-		});
-		const auto tick = m_scheduler.CurrentTick();
-		m_scheduler.Wait(tick);
-		m_scheduler.WaitPriorityOperations(tick);
-	};
-
-	const uint64_t cap = m_download_buffer.Size();
-	size_t         i   = 0;
-	while (i < copies.size()) {
-		std::vector<vk::BufferCopy> batch;
-		uint64_t                    batch_size = 0;
-		while (i < copies.size()) {
-			vk::BufferCopy piece = copies[i];
-			uint64_t       need  = Common::AlignUp(piece.size, 64);
-			if (need > cap) {
-				if (!batch.empty()) {
-					break;
-				}
-				piece.size = cap;
-				need       = cap;
-				copies[i].srcOffset += cap;
-				copies[i].size -= cap;
-				if (copies[i].size == 0) {
-					++i;
-				}
-			} else if (batch_size + need > cap && !batch.empty()) {
-				break;
-			} else {
-				++i;
-			}
-			piece.dstOffset = batch_size;
-			batch.push_back(piece);
-			batch_size += need;
-		}
-		flush_batch(std::move(batch), batch_size);
 	}
-	(void)total_size;
+	const auto& download = temporary ? *temporary : m_download_buffer;
+	for (auto& copy: copies) {
+		copy.dstOffset += offset;
+	}
+
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto              native = command.Handle();
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = buffer.Handle();
+	before.offset              = 0;
+	before.size                = buffer.Size();
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+	                       nullptr);
+	native.copyBuffer(buffer.Handle(), download.Handle(),
+	                  static_cast<uint32_t>(copies.size()), copies.data());
+
+	auto after          = before;
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	after.buffer        = download.Handle();
+	after.offset        = offset;
+	after.size          = total_size;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands |
+	                           vk::PipelineStageFlagBits::eHost,
+	                       {}, 0, nullptr, 1, &after, 0, nullptr);
+	m_scheduler.DeferPriorityOperation([this, mapped, offset, total_size, buffer_address,
+	                                    copies = std::move(copies), owner = std::move(temporary)] {
+		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
+		for (const auto& copy: copies) {
+			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
+			                                      mapped + (copy.dstOffset - offset), copy.size);
+		}
+	});
 	return true;
 }
 
@@ -491,7 +459,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
-		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
+		if (mapped != nullptr) {
+			std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
 			m_stream_buffer.Commit();
 			return {&m_stream_buffer, offset};
 		}
@@ -527,8 +496,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
-	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size))) {
+	if (staging == nullptr || !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
 	}
 	m_staging_buffer.Commit();

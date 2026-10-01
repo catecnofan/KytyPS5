@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
@@ -1702,6 +1703,61 @@ void TestShaderStageBarriers() {
         "independent vertex invocations retained a workgroup barrier");
 }
 
+void TestVertexBufferGrouping() {
+  const uint32_t shader[] = {EncodeSopp(0x01)};
+  std::array<uint16_t, static_cast<size_t>(AgcDirectResourceType::Last) + 1> offsets;
+  offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
+  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] = 0;
+  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+  ShaderUserData user_data{};
+  user_data.direct_resource_count = offsets.size();
+  user_data.direct_resource_offset = offsets.data();
+  std::array<ShaderSemantic, 4> semantics{};
+  for (uint32_t i = 0; i < semantics.size(); i++) {
+    semantics[i].semantic = i;
+    semantics[i].hardware_mapping = i;
+    semantics[i].size_in_elements = 1;
+  }
+  ShaderMappedData mapped{};
+  mapped.user_data = &user_data;
+  mapped.code_size_bytes = sizeof(shader);
+  mapped.input_semantics = semantics.data();
+  mapped.num_input_semantics = semantics.size();
+  HW::VertexShaderInfo regs{};
+  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+  regs.gs_regs.rsrc2.user_sgpr = 4;
+  ShaderMapUserData(regs.es_regs.data_addr, mapped);
+  std::array<ShaderBufferResource, 4> descriptors{};
+  const std::array<uint32_t, 4> attributes{0, 1u | (1u << 26u), 2, 3};
+  const std::array<uint64_t, 2> pointers{
+      reinterpret_cast<uint64_t>(descriptors.data()),
+      reinterpret_cast<uint64_t>(attributes.data())};
+  std::memcpy(regs.gs_user_sgpr.value, pointers.data(), sizeof(pointers));
+  ShaderVertexInputInfo input{};
+  for (const uint64_t base : {0x1000u, 0x3000u}) {
+    for (auto &descriptor : descriptors) {
+      descriptor.fields[1] = 16u << 16u;
+      descriptor.fields[2] = 8;
+      descriptor.UpdateAddress48(base);
+    }
+    descriptors[0].UpdateAddress48(base + 8);
+    descriptors[1].UpdateAddress48(base + 4);
+    descriptors[3].fields[1] = 0; // Constant attributes use their own buffer.
+    (void)PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, input);
+    Check(input.resources_num == 4 && input.buffers_num == 3 &&
+              input.resources_dst[0].buffer_index == 0 &&
+              input.resources_dst[1].buffer_index == 1 &&
+              input.resources_dst[2].buffer_index == 0 &&
+              input.resources_dst[3].buffer_index == 2,
+          "interleaved vertex attributes lost their stride or instance-rate binding");
+    Check(input.buffers[0].addr == base && input.buffers[1].addr == base + 4 &&
+              input.buffers[1].fetch_index == 1 && input.buffers[2].stride == 0 &&
+              input.resources[0].Base48() - input.buffers[0].addr == 8 &&
+              input.resources[2].Base48() == input.buffers[0].addr,
+          "a later lower-address attribute or changed table left stale vertex offsets");
+  }
+}
+
 void TestNggVertexEntryState() {
   using namespace ShaderRecompiler;
   // PPSA03309 shader 5a39eb2021a5d2c1: retain its NGG prologue and replace
@@ -1828,37 +1884,41 @@ void TestSopkCompareImmediateExtension() {
   }
 }
 
-void TestDisabledSystemDebugBranch() {
+void TestDisabledDebugBranches() {
   using namespace ShaderRecompiler;
-  // Relocate PPSA08709 MS pc 0x530 to zero, retaining its displacement to the
-  // system validation helper immediately after the main shader's S_ENDPGM.
-  std::array<uint32_t, 274> shader;
-  shader.fill(EncodeSopp(0x00));
-  shader[0] = 0xbf97010fu;
-  shader[1] = EncodeVop1(0x01, 1, 129);
-  shader[2] = EncodeMubuf0(0x1c, 0, false);
-  shader[3] = EncodeMubuf1(1, 0, 0);
-  shader[271] = EncodeSopp(0x01);
-  shader[272] = 0xffffffffu; // System-only helper must not be decoded.
-  shader[273] = 0xffffffffu;
-  Decoder::Program decoded;
-  Decoder::DecodeProgram(shader, decoded);
-  Check(decoded.instructions.front().opcode == Decoder::Opcode::S_CBRANCH_CDBGSYS &&
-            decoded.instructions.front().branch_target == 0x440u &&
-            decoded.instructions.back().pc == 0x43cu &&
-            decoded.instructions.back().opcode == Decoder::Opcode::S_ENDPGM,
-        "disabled system debug branch reached its post-ENDPGM validation helper");
-  auto graph = CFG::BuildGraph(decoded);
-  Check(graph.blocks.size() == 1u && graph.FindBlockByPc(0x440u) == nullptr &&
-            graph.blocks.front().terminator.kind == CFG::TerminatorKind::Return,
-        "disabled system debug branch changed normal shader control flow");
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-  auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("S_CBRANCH_CDBGSYS 0x00000440") != std::string::npos) &&
-            (result.ir_dump.find("StoreBufferU32") != std::string::npos),
-        "disabled system debug branch lost its identity or fallthrough write");
-  CheckSpirvBinaryValidates(result.spirv);
+  // Both debug branches fall through when conditional shader debugging is disabled.
+  // Retain the post-ENDPGM helper displacement from PPSA08709 and exercise the
+  // OR_USER variant encountered in PPSA03671 with the same body.
+  for (const auto opcode : {Decoder::Opcode::S_CBRANCH_CDBGSYS,
+                            Decoder::Opcode::S_CBRANCH_CDBGSYS_OR_USER}) {
+    std::array<uint32_t, 274> shader;
+    shader.fill(EncodeSopp(0x00));
+    shader[0] = EncodeSopp(opcode == Decoder::Opcode::S_CBRANCH_CDBGSYS ? 0x17 : 0x19, 0x10f);
+    shader[1] = EncodeVop1(0x01, 1, 129);
+    shader[2] = EncodeMubuf0(0x1c, 0, false);
+    shader[3] = EncodeMubuf1(1, 0, 0);
+    shader[271] = EncodeSopp(0x01);
+    shader[272] = 0xffffffffu; // Debug-only helper must not be decoded.
+    shader[273] = 0xffffffffu;
+    Decoder::Program decoded;
+    Decoder::DecodeProgram(shader, decoded);
+    Check(decoded.instructions.front().opcode == opcode &&
+              decoded.instructions.front().branch_target == 0x440u &&
+              decoded.instructions.back().pc == 0x43cu &&
+              decoded.instructions.back().opcode == Decoder::Opcode::S_ENDPGM,
+          "disabled debug branch reached its post-ENDPGM validation helper");
+    auto graph = CFG::BuildGraph(decoded);
+    Check(graph.blocks.size() == 1u && graph.FindBlockByPc(0x440u) == nullptr &&
+              graph.blocks.front().terminator.kind == CFG::TerminatorKind::Return,
+          "disabled debug branch changed normal shader control flow");
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.dump_ir = true;
+    auto result = RecompileForTest(shader, options);
+    Check((result.decoded_dump.find(" 0x00000440") != std::string::npos) &&
+              (result.ir_dump.find("StoreBufferU32") != std::string::npos),
+          "disabled debug branch lost its identity or fallthrough write");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
 }
 
 void TestNewShaderRecompilerRdna2ScalarOpcodes() {
@@ -8524,11 +8584,17 @@ void TestNestedSelectionPreservesDescriptorSources() {
           "nested descriptor selection lost its structured resource bindings");
     for (size_t i = 0; i < result.program.info.buffers.size(); ++i) {
       const auto pc = result.program.info.buffers[i].first_use_pc;
-      const uint32_t expected = pc == 8u * 4u ? table[0]
-                                : pc == 14u * 4u ? table[4]
-                                : pc == direct_arm * 4u ? user_data[8]
-                                : pc == join * 4u ? user_data[4] : 0u;
-      Check(expected != 0u && result.resources.buffers[i].dwords[0] == expected,
+      Check(pc == 8u * 4u || pc == 14u * 4u || pc == direct_arm * 4u || pc == join * 4u,
+            "nested descriptor selection lost a native source location");
+      const auto selected_pc = (mode == 0u ? 8u : mode == 1u ? 14u : direct_arm) * 4u;
+      const auto *expected = pc == 8u * 4u ? table.data()
+                           : pc == 14u * 4u ? table.data() + 4
+                           : pc == direct_arm * 4u ? user_data.data() + 8 : user_data.data() + 4;
+      const auto &descriptor = result.resources.buffers[i];
+      const bool unused = pc != selected_pc && pc != join * 4u;
+      Check(descriptor.dword_count == 4 &&
+                (std::equal(expected, expected + 4, descriptor.dwords.begin()) ||
+                 (unused && std::ranges::all_of(descriptor.dwords, [](auto word) { return word == 0; }))),
             "nested descriptor selection chose another arm's descriptor");
     }
     CheckSpirvBinaryValidates(result.spirv);
@@ -8636,10 +8702,10 @@ void TestNativeScalarReadDescriptorPlanning() {
     auto options = MakeCompileOptions(ShaderType::Pixel);
     options.user_data = user_data;
     const auto result = RecompileForTest(shader, options, ReadHostTestMemory);
-    Check(!result.program.dispatcher_fallback && result.resources.buffers.size() == 1u &&
-              std::ranges::equal(result.resources.flattened_srt, table),
-          "scalar descriptor planning retained an unrelated native execution mask");
     const auto expected = mode == 2u ? table : std::array<uint32_t, 4>{};
+    Check(!result.program.dispatcher_fallback && result.resources.buffers.size() == 1u &&
+              std::ranges::equal(result.resources.flattened_srt, expected),
+          "scalar descriptor planning retained an unrelated native execution mask");
     Check(std::equal(expected.begin(), expected.end(), result.resources.buffers[0].dwords.begin()),
           "scalar descriptor planning selected the wrong native resource");
     CheckSpirvBinaryValidates(result.spirv);
@@ -10048,6 +10114,44 @@ void TestMergedShaderUserDataSnapshot() {
   Check(fan_input.mesh.primitives_per_group == 30 && fan_input.mesh.vertices_per_group == 32 &&
             fan_input.mesh.max_vertices == 256 && fan_input.mesh.max_primitives == 192,
         "captured triangle-fan GS configuration lost its subgroup assembly limits");
+  context.SetShaderStages(0x00482030u);
+  context.SetMaxOutputPerSubgroup(32);
+  context.SetGsMaxVertOut(32);
+  user_config.SetPrimitiveType(Prospero::PrimitiveType::kPointList);
+  user_config.SetGeControl({1, 1});
+  regs.gs_regs.rsrc1.gs_vgpr_component_count = 0;
+  regs.gs_regs.rsrc2.es_vgpr_component_count = 1;
+  ShaderVertexInputInfo fast_input{};
+  PrepareProgram(regs, context, user_config, fast_input);
+  Check(fast_input.mesh.fast_launch && fast_input.mesh.threads_num[0] == 32 &&
+            fast_input.mesh.primitives_per_group == 1 && fast_input.mesh.vertices_per_group == 1 &&
+            fast_input.mesh.max_vertices == 32 && fast_input.mesh.max_primitives == 32,
+        "captured fast-launch shader lost its per-group launch and output limits");
+  auto ordinary_input = fast_input;
+  ordinary_input.mesh.fast_launch = false;
+  Check(MakeStageStaticKey(fast_input) != MakeStageStaticKey(ordinary_input),
+        "fast launch shared the ordinary input-assembly shader key");
+
+  const uint32_t fast_code[] = {
+      EncodeSMovB32(124, 255), 0x20020u, // allocate the full 32 vertices and primitives
+      EncodeSopp(0x10, 9),
+      EncodeVop1(0x01, 0, 256 + 5),
+      EncodeVop1(0x01, 1, 256 + 6),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 0, 1),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01),
+  };
+  options.input_info.vertex = &fast_input;
+  options.wave_size = fast_input.mesh.wave_size;
+  options.back_code = {};
+  const auto fast_result = RecompileForTest(fast_code, options);
+  CheckSpirvBinaryValidates(fast_result.spirv);
+  Check(fast_result.program.memory_info.empty(),
+        "compiled fast-launch entry retained an unused index-buffer resource");
+  const auto fast_source = DisassembleSpirvBinary(fast_result.spirv);
+  Check(SpirvSourceHasInstructionUsing(fast_source, "OpExecutionMode", "OutputVertices 32") &&
+            SpirvSourceHasInstructionUsing(fast_source, "OpExecutionMode", "OutputPrimitivesEXT 32"),
+        "fast-launch SPIR-V truncated the mesh output capacity");
+
 }
 
 void TestEmbeddedFetchPreservesSharedScalarLoad() {
@@ -10096,6 +10200,39 @@ void TestEmbeddedFetchPreservesSharedScalarLoad() {
                        result.resources.buffers[0].dwords.begin()),
         "embedded fetch discarded a scalar-load component used by another buffer read");
   CheckSpirvBinaryValidates(result.spirv);
+
+  const auto key = MakeStageStaticKey(input);
+  const auto compile = [&](const ShaderVertexInputInfo &vertex) {
+    auto variant_options = options;
+    variant_options.input_info.vertex = &vertex;
+    return RecompileForTest(code, variant_options).spirv;
+  };
+  auto layout = input;
+  layout.resources_dst[0].register_start = 32;
+  layout.resources_dst[0].fetch_index = 1;
+  layout.resources[0].UpdateAddress48(0x56780000u);
+  layout.resources[0].fields[1] = 52u << 16u;
+  layout.resources[0].fields[2] = 128;
+  layout.resources[0].fields[3] |= 3u << 28u;
+  layout.buffers_num = 1;
+  layout.buffers[0] = {.addr = 0x56780000u, .stride = 52, .num_records = 128,
+                       .fetch_index = 1};
+  Check(compile(layout) == result.spirv,
+        "pipeline-only vertex layout changed the embedded-fetch shader");
+  Check(MakeStageStaticKey(layout) == key,
+        "pipeline-only vertex layout fragmented the shader module cache key");
+
+  auto formatted = input;
+  formatted.resources[0].fields[3] =
+      (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32UInt) << 12u) |
+      DstSel(4, 5, 6, 7);
+  Check(compile(formatted) != result.spirv && MakeStageStaticKey(formatted) != key,
+        "vertex input numeric type lost its shader module specialization");
+  auto swizzled = input;
+  swizzled.resources[0].fields[3] =
+      (swizzled.resources[0].fields[3] & ~0xfffu) | DstSel(5, 4, 6, 7);
+  Check(compile(swizzled) != result.spirv && MakeStageStaticKey(swizzled) != key,
+        "vertex input destination selectors lost their shader module specialization");
 }
 
 void TestEmbeddedVertexFormatSwizzle() {
@@ -10147,7 +10284,7 @@ void TestEmbeddedVertexFormatSwizzle() {
     Decoder::Program decoded;
     Decoder::DecodeProgram(code, decoded);
     const uint32_t attribute = static_cast<uint32_t>(test.attribute_format) << 5u;
-    const uint32_t buffer[] = {0x10000000u, 16u << 16u, 1u,
+    uint32_t buffer[] = {0x10000000u, 16u << 16u, 1u,
                                (static_cast<uint32_t>(test.format) << 12u) | test.swizzle};
     HW::VertexShaderInfo regs{};
     regs.es_regs.data_addr = reinterpret_cast<uint64_t>(code);
@@ -10166,6 +10303,16 @@ void TestEmbeddedVertexFormatSwizzle() {
     ShaderMapUserData(regs.es_regs.data_addr, mapped);
     ShaderVertexInputInfo input{};
     PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, input);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    if (&test == cases) {
+      for (const auto [word, flag] : {std::pair{1u, 1u << 31u}, std::pair{3u, 1u << 23u}}) {
+        buffer[word] |= flag;
+        ExpectFatal([&] { PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, input); },
+                    "unsupported vertex fetch flags bypassed acquisition validation");
+        buffer[word] &= ~flag;
+      }
+    }
+#endif
     Frontend::EmbeddedFetchPlan fetch;
     fetch.loads.push_back({.pc = 0, .attrib_id = 0, .components = test.components});
     Frontend::TranslateOptions options{};
@@ -10218,8 +10365,10 @@ void TestMeshInputAssembly() {
     uint32_t wave_info, first, second, third, byte_offset, vertex_id;
     bool fetch;
     uint32_t wave_size = 64;
+    bool fast_launch = false;
+    uint32_t threads = 256;
   };
-  const Case cases[] = {
+  std::vector<Case> cases = {
       {Prospero::PrimitiveType::kTriList, 14, 177, 14, 2, 2, 0x1002, UINT32_MAX,
        0x40000309, 6, 7, 8, 340, 0xabcc, true},
       {Prospero::PrimitiveType::kTriList, 14, 177, 14, 9, 2, 0x1002, 0,
@@ -10267,14 +10416,30 @@ void TestMeshInputAssembly() {
       {Prospero::PrimitiveType::kTriStrip, 40, 40, 0, 32, 0, 0, 11,
        0x81000608, 32, 33, 34, 0, 43, false, 32},
   };
+  for (const uint32_t wave_size : {32u, 64u}) {
+    for (const uint32_t threads : {wave_size, 2u * wave_size}) {
+      for (const uint32_t group : {0u, 1u, 11u}) {
+        for (const uint32_t lane : {0u, wave_size - 1u, threads - 1u}) {
+          const uint32_t wave_info = ((threads / wave_size) << 28u) |
+                                     ((lane / wave_size) << 24u) |
+                                     (lane < wave_size ? 0x101u : 0u);
+          const uint32_t base_vertex = group == 11u ? UINT32_MAX : 11u;
+          cases.push_back({Prospero::PrimitiveType::kPointList, 1, 12, group, lane, 0, 0,
+                           base_vertex, wave_info, 0, 0, 0, 0, group + base_vertex, false,
+                           wave_size, true, threads});
+        }
+      }
+    }
+  }
   for (const auto &test : cases) {
     ShaderVertexInputInfo input{};
     auto &mesh = input.mesh;
     mesh.input_primitive = static_cast<uint32_t>(test.topology);
     mesh.wave_size = test.wave_size;
+    mesh.fast_launch = test.fast_launch;
     mesh.primitives_per_group = mesh.InputPrimitiveCount(test.capacity);
     mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
-    mesh.threads_num[0] = 256;
+    mesh.threads_num[0] = test.threads;
     mesh.threads_num[1] = mesh.threads_num[2] = 1;
     Decoder::Program decoded;
     CFG::Graph graph;
@@ -10307,16 +10472,21 @@ void TestMeshInputAssembly() {
       }
     }
     ConstantPropagationPass(program.blocks);
-    Check(load != nullptr && load->Arg(1).Resolve().U32() == test.byte_offset &&
-              load->Arg(3).Resolve().U1() == test.fetch,
-          "mesh index fetch address or active-lane predicate is wrong");
-    const auto *resource = load->Arg(0).ResolveInstruction();
-    Check(resource != nullptr && resource->Arg(0).Resolve().U32() == (test.address_low & ~3u) &&
-              resource->Arg(1).Resolve().U32() == 0x12 &&
-              program.memory_info[load->Flags<MemoryFlags>().index].kind == ResourceKind::Global,
-          "mesh index fetch lost its aligned guest address resource");
-    load->ReplaceUsesWith(Value(test.fetch ? 0xabcd0123u : 0u));
-    ConstantPropagationPass(program.blocks);
+    if (test.fast_launch) {
+      Check(load == nullptr && program.memory_info.empty(),
+            "fast launch emitted an ordinary input-assembly index resource");
+    } else {
+      Check(load != nullptr && load->Arg(1).Resolve().U32() == test.byte_offset &&
+                load->Arg(3).Resolve().U1() == test.fetch,
+            "mesh index fetch address or active-lane predicate is wrong");
+      const auto *resource = load->Arg(0).ResolveInstruction();
+      Check(resource != nullptr && resource->Arg(0).Resolve().U32() == (test.address_low & ~3u) &&
+                resource->Arg(1).Resolve().U32() == 0x12 &&
+                program.memory_info[load->Flags<MemoryFlags>().index].kind == ResourceKind::Global,
+            "mesh index fetch lost its aligned guest address resource");
+      load->ReplaceUsesWith(Value(test.fetch ? 0xabcd0123u : 0u));
+      ConstantPropagationPass(program.blocks);
+    }
     std::array<uint32_t, 9> vgprs{};
     uint32_t sgpr3 = 0;
     for (const auto &inst : *program.blocks.front()) {
@@ -10327,7 +10497,8 @@ void TestMeshInputAssembly() {
       }
     }
     Check(sgpr3 == test.wave_info && vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
-              vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id && vgprs[8] == 9,
+              vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id &&
+              vgprs[test.fast_launch ? 6 : 8] == 9u,
           "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
   }
 }
@@ -10567,19 +10738,6 @@ void TestNewShaderRecompilerClipDisabledPosition() {
   shifted.clip_space.offset[0] += 1.0f;
   Check(MakeStageStaticKey(clipped) != MakeStageStaticKey(shifted),
         "clip-disabled viewport transform is absent from the shader cache key");
-
-  ShaderVertexInputInfo layout_a{};
-  layout_a.resources_num = 1;
-  layout_a.buffers_num = 1;
-  layout_a.buffers[0].attr_num = 1;
-  layout_a.buffers[0].attr_indices[0] = 0;
-  layout_a.buffers[0].stride = 16;
-  auto layout_b = layout_a;
-  layout_b.buffers[0].stride = 32;
-  layout_b.buffers[0].fetch_index = 1;
-  layout_b.buffers[0].attr_offsets[0] = 4;
-  Check(MakeStageStaticKey(layout_a) == MakeStageStaticKey(layout_b),
-        "pipeline-only vertex layout fragmented the shader module cache key");
 }
 
 void TestNewShaderRecompilerAuxPositionExports() {
@@ -11407,6 +11565,124 @@ void TestValuePhiValidation() {
 #endif
 }
 
+void TestWave32MaskProjection() {
+  using namespace ShaderRecompiler::IR;
+  for (const uint32_t wave_size : {32u, 64u}) {
+    Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = wave_size;
+    for (uint32_t id = 0; id < 3; ++id) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+      program.block_info.push_back({.id = id});
+    }
+    auto *entry = program.blocks[0];
+    auto *loop = program.blocks[1];
+    entry->AddBranch(loop);
+    loop->AddBranch(loop);
+    loop->AddBranch(program.blocks[2]);
+    program.block_info[0].terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
+    program.block_info[0].terminator.true_block = 1;
+    program.block_info[1].terminator.kind = ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    program.block_info[1].terminator.true_block = 1;
+    program.block_info[1].terminator.false_block = 2;
+    program.block_info[2].terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Return;
+    IREmitter e(entry);
+    const auto zero = U32(Value(0u));
+    const auto raw = e.GetUserData(static_cast<ScalarReg>(0));
+    const auto active = e.INotEqual(raw, zero);
+    const auto selected = e.IEqual(raw, U32(Value(7u)));
+    const auto ballot = [&](IREmitter &ir, U1 predicate, uint32_t component = 0u) {
+      return ir.CompositeExtract(ir.Emit(ValueOpcode::Ballot, {predicate}), component);
+    };
+    const auto thread_bit = [&](IREmitter &ir, U32 word, bool own_lane = true) {
+      const auto bit = own_lane
+          ? ir.BitwiseAnd(U32(ir.Emit(ValueOpcode::LaneId)), U32(Value(31u)))
+          : U32(Value(3u));
+      return ir.INotEqual(ir.BitwiseAnd(ir.ShiftRightLogical(word, bit), U32(Value(1u))), zero);
+    };
+    const auto active_mask = ballot(e, active);
+    const auto direct = thread_bit(e, active_mask);
+    const auto arbitrary = thread_bit(e, raw);
+    const auto mixed = thread_bit(e, e.BitwiseAnd(active_mask, raw));
+    const auto mixed_or = thread_bit(e, e.BitwiseOr(active_mask, raw));
+    const auto mixed_select = thread_bit(e, e.Select(selected, active_mask, raw));
+    const auto different_lane = thread_bit(e, active_mask, false);
+    const auto high_half = thread_bit(e, ballot(e, active, 1u));
+    const auto initial_mask = e.BitwiseAnd(active_mask, ballot(e, selected));
+    const auto raw_consumer = e.Emit(ValueOpcode::IAdd32, {initial_mask, Value(3u)});
+    const auto initial_predicate = e.LogicalAnd(active, selected);
+    const auto entry_size = entry->Instructions().size();
+    ConstantPropagationPass({entry}, wave_size);
+    Check(entry->Instructions().size() == entry_size,
+          "rejected mixed mask graph left unused projected instructions");
+    const auto combined_mask = e.BitwiseOr(active_mask, ballot(e, selected));
+    const auto combined = thread_bit(e, combined_mask);
+    const auto gated_mask = e.Select(selected, combined_mask, zero);
+    const auto gated = thread_bit(e, gated_mask);
+    const auto rejected = thread_bit(e, e.Select(selected, zero, combined_mask));
+    const auto combined_predicate = e.LogicalOr(active, selected);
+    const auto gated_predicate = e.LogicalAnd(selected, combined_predicate);
+    const auto rejected_predicate = e.Emit(ValueOpcode::SelectU1,
+                                          {selected, Value(false), combined_predicate});
+    const auto gated_raw_consumer = e.Emit(ValueOpcode::IAdd32, {gated_mask, Value(3u)});
+    auto &mask = loop->AppendNewInst(ValueOpcode::Phi);
+    mask.SetFlags(Type::U32);
+    auto &predicate = loop->AppendNewInst(ValueOpcode::Phi);
+    predicate.SetFlags(Type::U1);
+    IREmitter body(loop);
+    const auto matches = body.LogicalAnd(U1(Value(&predicate)), selected);
+    const auto remaining = body.BitwiseAnd(U32(Value(&mask)), body.BitwiseNot(ballot(body, matches)));
+    const auto remaining_predicate = body.LogicalAnd(U1(Value(&predicate)), body.LogicalNot(matches));
+    const auto remaining_live = thread_bit(body, remaining);
+    const auto live = thread_bit(body, U32(Value(&mask)));
+    mask.AddPhiOperand(entry, initial_mask);
+    mask.AddPhiOperand(loop, remaining);
+    predicate.AddPhiOperand(entry, initial_predicate);
+    predicate.AddPhiOperand(loop, remaining_predicate);
+    program.block_info[1].condition = remaining_predicate;
+
+    ConstantPropagationPass(program.blocks, wave_size);
+    if (wave_size == 32u) {
+      Check(direct.Resolve() == active.Resolve(), "wave32 ballot round trip lost its predicate");
+      Check(EquivalentValue(program, combined, combined_predicate),
+            "wave32 OR mask projection changed a lane predicate");
+      Check(EquivalentValue(program, gated, gated_predicate) &&
+                EquivalentValue(program, rejected, rejected_predicate),
+            "wave32 select mask projection changed a scalar gate or selected arm");
+      Check(EquivalentValue(program, live.Resolve(), Value(&predicate)),
+            "projected mask Phi differs from the existing per-lane EXEC Phi");
+      Check(EquivalentValue(program, remaining_live.Resolve(), remaining_predicate) &&
+                std::count_if(loop->begin(), loop->end(), [](const Inst &inst) {
+                  return inst.GetOpcode() == ValueOpcode::LogicalAnd;
+                }) == 3,
+            "backedge-first projection duplicated the loop's logical mask operation");
+      const auto *projected = live.Resolve().TryInstruction();
+      Check(projected != nullptr && projected->GetOpcode() == ValueOpcode::Phi &&
+                projected->GetType() == Type::U1 && projected->PhiBlock(0) == entry &&
+                projected->PhiBlock(1) == loop,
+            "mask projection lost loop Phi type or predecessor order");
+    } else {
+      Check(direct.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
+                live.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
+                combined.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
+                gated.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
+                rejected.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32,
+            "wave64 low-half mask was projected onto the wrong invocation");
+    }
+    for (const auto value : {arbitrary, mixed, mixed_or, mixed_select, different_lane, high_half}) {
+      Check(value.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32,
+            "mask projection accepted an arbitrary mask, lane or ballot half");
+    }
+    Check(raw_consumer.Resolve().TryInstruction()->Arg(0).Resolve() == initial_mask.Resolve() &&
+              gated_raw_consumer.Resolve().TryInstruction()->Arg(0).Resolve() == gated_mask.Resolve(),
+          "mask projection changed a raw scalar mask consumer");
+    ResolveControlFlowIdentities(program);
+    RemoveIdentities(program.blocks);
+    ValidateProgram(program, true);
+  }
+}
+
 void TestU64ShiftConstantPropagation() {
   using namespace ShaderRecompiler::IR;
 
@@ -12208,6 +12484,116 @@ void TestRenderTargetReverseExportMapping() {
   PrepareProgram(regs, sh, mappings, compiled_info);
   Check(compiled_info.target_export_mapping[0] == gr32.export_mapping,
       "active reverse MRT mapping was lost before shader specialization");
+}
+
+void TestBlendMappingClassification() {
+  using Factor = Prospero::BlendFactor;
+  using Support = BlendMappingSupport;
+  HW::BlendControl blend{};
+  blend.separate_alpha_blend = false;
+  const auto classify = [&](Prospero::ColorComponentMapping mapping) {
+    return ClassifyBlendMapping(blend, mapping);
+  };
+  for (const auto factor : {Factor::kConstantAlpha, Factor::kOneMinusConstantAlpha}) {
+    blend.color_srcblend = static_cast<uint8_t>(factor);
+    Check(classify(Prospero::ColorMappingAbgr) == Support::Direct,
+          "scalar blend constant incorrectly required physical alpha");
+  }
+  for (const auto factor : {Factor::kConstantColor, Factor::kOneMinusConstantColor}) {
+    blend.color_srcblend = static_cast<uint8_t>(factor);
+    Check(classify(Prospero::ColorMappingRgba) == Support::Direct &&
+              classify(Prospero::ColorMappingBgra) == Support::Unsupported &&
+              classify(Prospero::ColorMappingAbgr) == Support::Unsupported,
+          "logical blend constants were accepted with shuffled color components");
+  }
+  blend.color_srcblend = static_cast<uint8_t>(Factor::kOne);
+  blend.alpha_srcblend = static_cast<uint8_t>(Factor::kConstantColor);
+  blend.separate_alpha_blend = true;
+  Check(classify(Prospero::ColorMappingBgra) == Support::Direct &&
+            classify(Prospero::ColorMappingAbgr) == Support::Unsupported,
+        "separate constant-color alpha equation ignored the physical alpha location");
+  blend.color_srcblend = static_cast<uint8_t>(Factor::kSrcAlpha);
+  blend.separate_alpha_blend = false;
+  Check(classify(Prospero::ColorMappingAbgr) == Support::SourceAlpha,
+        "reversed source-alpha blending did not request logical alpha");
+  blend.separate_alpha_blend = true;
+  Check(classify(Prospero::ColorMappingAbgr) == Support::Unsupported,
+        "different alpha equations were accepted on a reversed target");
+  blend.separate_alpha_blend = false;
+  blend.color_srcblend = static_cast<uint8_t>(Factor::kDstAlpha);
+  Check(classify(Prospero::ColorMappingAbgr) == Support::Unsupported,
+        "destination alpha incorrectly used the physical alpha channel");
+}
+
+void TestLogicalAlphaBlendExport() {
+  ShaderPixelInputInfo pixel{};
+  pixel.target_output_mode[0] = 4;
+  pixel.target_export_mapping[0] = Prospero::ColorMappingAbgr;
+  const auto ordinary_key = MakeStageStaticKey(pixel);
+  pixel.dual_source_blending = true;
+  const auto guest_key = MakeStageStaticKey(pixel);
+  pixel.alpha_blend_source_remap = true;
+  const auto remapped_key = MakeStageStaticKey(pixel);
+  Check(ordinary_key != guest_key && guest_key != remapped_key &&
+            ordinary_key != remapped_key,
+        "ordinary, guest dual-source, and logical-alpha shaders share a cache key");
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel;
+  for (const bool compressed : {false, true}) {
+    const uint32_t shader[] = {
+        // RGBA = (1000, 2, 3, 0.25), packed into two half pairs when compressed.
+        EncodeVop1(0x01, 0, 255), compressed ? 0x400063d0u : 0x447a0000u,
+        EncodeVop1(0x01, 1, 255), compressed ? 0x34004200u : 0x40000000u,
+        EncodeVop1(0x01, 2, 255), 0x40400000u,
+        EncodeVop1(0x01, 3, 255), 0x3e800000u,
+        EncodeExp0(0, 0xf, false, compressed), EncodeExp1(0, 1, 2, 3),
+        EncodeExp0(1, 0xf, false), EncodeExp1(0, 0, 0, 0),
+        EncodeExp0(2, 0xf, true, false, true), EncodeExp1(0, 0, 0, 0),
+        EncodeSopp(0x01),
+    };
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(source.find("OpDecorate %out_mrt_1 Location 0") != std::string::npos &&
+              source.find("OpDecorate %out_mrt_1 Index 1") != std::string::npos &&
+              CountSourceOccurrences(source, "OpStore %out_mrt_1 ") == 1 &&
+              source.find("out_mrt_2") == std::string::npos,
+          "inactive MRT exports overwrote the logical-alpha output");
+    Check(SpirvInstructionOpcodeCount(result.spirv, 252u) != 0,
+          "ignoring inactive MRT stores discarded their valid-mask export");
+    uint32_t alpha_input = 0;
+    uint32_t color_input = 0;
+    for (size_t i = 5; i < result.spirv.size(); i += result.spirv[i] >> 16u) {
+      if ((result.spirv[i] & 0xffffu) != 79u || (result.spirv[i] >> 16u) != 9u) {
+        continue;
+      }
+      const auto selectors = std::span(result.spirv).subspan(i + 5, 4);
+      if (std::ranges::equal(selectors, std::array{3u, 3u, 3u, 3u})) {
+        alpha_input = result.spirv[i + 3];
+      } else if (std::ranges::equal(selectors, std::array{3u, 2u, 1u, 0u})) {
+        color_input = result.spirv[i + 3];
+      }
+    }
+    Check(alpha_input != 0 && alpha_input == color_input,
+          "blend source did not broadcast logical alpha before the physical export swizzle");
+  }
+
+  const uint32_t guest_shader[] = {
+      EncodeExp0(0, 0xf, false), EncodeExp1(0, 1, 2, 3),
+      EncodeExp0(1, 0xf), EncodeExp1(4, 5, 6, 7), EncodeSopp(0x01),
+  };
+  pixel.alpha_blend_source_remap = false;
+  pixel.target_output_mode[1] = pixel.target_output_mode[0];
+  pixel.target_export_mapping = {};
+  const auto guest = RecompileForTest(guest_shader, options);
+  CheckSpirvBinaryValidates(guest.spirv);
+  const auto source = DisassembleSpirvBinary(guest.spirv);
+  Check(source.find("OpDecorate %out_mrt_1 Location 0") != std::string::npos &&
+            source.find("OpDecorate %out_mrt_1 Index 1") != std::string::npos &&
+            CountSourceOccurrences(source, "OpStore %out_mrt_1 ") == 1 &&
+            SpirvInstructionOpcodeCount(guest.spirv, 81u) == 8u,
+        "guest dual-source export was replaced by synthetic alpha");
 }
 
 void TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled() {
@@ -13321,11 +13707,11 @@ void TestPixelProgramCacheBindingIdentity() {
   Check(MakeStageStaticKey(no_depth_export) != MakeStageStaticKey(depth_export),
         "pixel shader identity omitted depth-export semantics");
 
-  auto check_program_identity = [&](const uint32_t *shader) {
+  auto check_program_identity = [&](std::span<const uint32_t> shader) {
     HW::PixelShaderInfo regs{};
-    regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+    regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader.data());
     ShaderMappedData mapped{};
-    mapped.code_size_bytes = sizeof(uint32_t);
+    mapped.code_size_bytes = static_cast<uint32_t>(shader.size_bytes());
     ShaderMapUserData(regs.ps_regs.data_addr, mapped);
 
     const std::array<Prospero::ColorComponentMapping, 8> identity_mappings{};
@@ -13340,7 +13726,8 @@ void TestPixelProgramCacheBindingIdentity() {
                                               second_info);
     CompilePixelRuntime(second_params, second_info);
     Check(
-        first_params.hash == second_params.hash &&
+        first_params.hash == XXH3_64bits(shader.data(), shader.size_bytes()) &&
+            first_params.hash == second_params.hash &&
             first_key == MakeStageStaticKey(second_info) &&
             first_info.stage.program != nullptr &&
             second_info.stage.program != nullptr,
@@ -13352,6 +13739,22 @@ void TestPixelProgramCacheBindingIdentity() {
   const auto request_10 = check_program_identity(shader_10);
   Check(request_01 == request_10,
         "relocated identical pixel programs did not share their source identity");
+
+  // Identical metadata after the scalar-literal prefix must not mask changes
+  // to the executable code when computing program identity.
+  std::array<uint32_t, 200> shader{};
+  shader[0] = 0xbeeb03ffu;
+  shader[1] = 0x5fu;
+  shader[2] = EncodeSMovB32(0, 129);
+  shader[3] = EncodeSopp(0x01);
+  shader[192] = 0x65726162u;
+  shader[193] = 0x746f6f66u;
+  shader[196] = 0x12345678u;
+  shader[197] = 0x9abcdef0u;
+  const auto first = check_program_identity(shader);
+  shader[2] = EncodeSMovB32(0, 130);
+  Check(check_program_identity(shader).first != first.first,
+        "re-registering changed code at the same address reused its old identity");
 
 }
 
@@ -13455,6 +13858,30 @@ void TestNewShaderRecompilerFlatAddressDomainsUseDma() {
   Check((result.ir_dump.find("GetScratchResource") != std::string::npos) &&
             result.program.scratch_dwords == 1,
         "SCRATCH incorrectly entered guest address tracking");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  // A local aperture proof must not admit a median which can still produce a
+  // canonical global address. Such stores need the existing ownership proof.
+  const uint32_t mixed_domain_store[] = {
+      EncodeSop1(0x04, 8, 237), // s_mov_b64 s[8:9], private_base
+      EncodeVop3Word0(0x159, 1),
+      EncodeVop3Word1(128, 9, 256 + 2), // median(0, private high, dynamic v2)
+      EncodeFlat0(0x1c, 0, 0), EncodeFlat1(0, 0x7d, 3, 0),
+      EncodeSopp(0x01),
+  };
+  ExpectFatal([&]() { (void)RecompileForTest(mixed_domain_store, options); },
+              "mixed local/global FLAT store bypassed GPU ownership tracking");
+  const uint32_t changed_mask_store[] = {
+      EncodeSop1(0x04, 8, 237), EncodeSop1(0x04, 10, 235),
+      EncodeVop1(0x01, 1, 128), // canonical old address high
+      EncodeSop1(0x03, 126, 255), 0x55555555u,
+      EncodeVop3Word0(0x159, 1), EncodeVop3Word1(9, 11, 256 + 2),
+      EncodeSop1(0x04, 126, 193), // restore all lanes after the median
+      EncodeFlat0(0x1c, 0, 0), EncodeFlat1(0, 0x7d, 3, 0),
+      EncodeSopp(0x01),
+  };
+  ExpectFatal([&]() { (void)RecompileForTest(changed_mask_store, options); },
+              "FLAT proof discarded a differently predicated address value");
+#endif
 }
 
 void TestCompilerStageInputOwnership() {
@@ -13840,7 +14267,7 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
-  TestRayTracingDispatchDetection();
+  TestRayTracingInstructions();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();
@@ -13855,6 +14282,7 @@ int main() {
   TestDemandDrivenSpirvDeclarations();
   TestNewShaderRecompilerSMovB32();
   TestShaderStageBarriers();
+  TestVertexBufferGrouping();
   TestNggVertexEntryState();
   TestNewShaderRecompilerClipDisabledPosition();
   TestNewShaderRecompilerAuxPositionExports();
@@ -13942,7 +14370,7 @@ int main() {
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
-  TestDisabledSystemDebugBranch();
+  TestDisabledDebugBranches();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
@@ -13960,6 +14388,7 @@ int main() {
   TestFinalSsaRejectsRegisterStatePseudos();
 #endif
   TestValuePhiValidation();
+  TestWave32MaskProjection();
   TestU64ShiftConstantPropagation();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNativeWideValueValidation();
@@ -13971,6 +14400,8 @@ int main() {
   TestNewShaderRecompilerPerInvocationU64Complement();
   TestNewShaderRecompilerExpPixelOutputs();
   TestRenderTargetReverseExportMapping();
+  TestBlendMappingClassification();
+  TestLogicalAlphaBlendExport();
   TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();
   TestTypedDescriptorRealWideMoveTranslation();
   TestComputeImageFill();

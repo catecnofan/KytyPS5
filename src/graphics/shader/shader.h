@@ -88,6 +88,7 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t max_vertices         = 0;
 	uint32_t max_primitives       = 0;
 	uint32_t provoking_vertex     = 0;
+	bool     fast_launch          = false;
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
@@ -178,6 +179,8 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_sample_mask_export_enable = false;
 	bool                                           ps_sample_shading            = false;
 	bool                                           dual_source_blending         = false;
+	// Export logical alpha through MRT1 for blending after channel swizzling.
+	bool                                           alpha_blend_source_remap     = false;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;
